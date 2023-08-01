@@ -120,11 +120,11 @@ func main() {
 	}
 	game.loadState()
 
+	game.startFindingFlint()
+
 	fmt.Println("Welcome to Cividler! The CLI based idle game.")
 	fmt.Println("Commands:")
-	fmt.Println("\"find flint\" to start finding flint.")
-	// fmt.Println("\"stop\" to stop finding flint.")
-	// fmt.Println("you currently have", game.flintCount, "flint(s).")
+	fmt.Println("Type \"help\" to see available commands.")
 
 	// Handle a Ctrl+C event
 	c := make(chan os.Signal)
@@ -140,11 +140,12 @@ func main() {
 		text, _ := reader.ReadString('\n')
 
 		switch strings.TrimSpace(text) {
-		case "find flint", "start":
-			game.startFindingFlint()
-		// case "stop":
-		// 	game.stopFindingFlint()
-		case "resources":
+		case "exit", "e":
+			// if the user imputs "exit", save th state and exit the game
+			fmt.Println("Saving and Exiting the game...")
+			game.saveState()
+			os.Exit(0)
+		case "resources", "r":
 			fmt.Println("Resources:")
 			for resource, count := range game.resourceMap {
 				fmt.Printf("|%s|%d|\n", resource, count)
@@ -152,10 +153,9 @@ func main() {
 		case "help":
 			fmt.Println("Commands")
 			fmt.Println("Commands:")
-			fmt.Println("\"find flint\" or \"start\" to start finding flint.")
-			// fmt.Println("\"stop\" to stop finding flint.")
-			fmt.Println("\"resources\" to see your current resource counts.")
-			fmt.Println("\"help\" to display this help message.")
+			fmt.Println("Type \"exit\" or \"e\" to save and cleanly exit the game.")
+			fmt.Println("Type \"resources\" or \"r\" to see your current resource counts.")
+			fmt.Println("Type \"help\" to display this help message.")
 		default:
 			fmt.Println("Invalid command. Type \"help\" for a list of valid commands.")
 		}
