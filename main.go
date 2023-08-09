@@ -2,414 +2,323 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/gob"
+	"encoding/json"
 	"fmt"
-	"log"
 	"os"
-	"os/signal"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/dgraph-io/badger/v4"
+	"github.com/fatih/color"
 )
 
-const (
-	CampProductionRate = 1
-	TownProductionRate = 2
-)
+type Camp struct {
+	Count int
+}
+
+type Village struct {
+	Count int
+}
+
+type Player struct {
+	Villagers int
+	Camps     Camp
+	Villages  Village
+}
 
 type Game struct {
-	resourceMap map[string]*Resource
-	done        chan bool
-	db          *badger.DB
-	ticker      *time.Ticker
+	Player             Player       `json:"player"`
+	Ticker             *time.Ticker `json:"-"`
+	LastSaved          time.Time    `json:"last_saved"`
+	HasNotifiedCamp    bool         `json:"-"`
+	HasNotifiedVillage bool         `json:"-"`
+	JustReset          bool         `json:"-"` // add reset flag to game struct
+	Done               chan bool    `json:"-"` // use "-" json:tag to tell the JSON package to ignore the channel during serialization
 }
 
-type Resource struct {
-	Name        string
-	Description string
-	Cost        int
-	Count       int
-	BaseRate    time.Duration
-	Rate        time.Duration
-	LastUpdated time.Time
-	TownEnabled bool
+type GameSerializable struct {
+	Player             Player    `json:"player"`
+	LastSaved          time.Time `json:"last_saved"`
+	JustReset          bool      `json:"-"` // add reset flag to game struct
+	HasNotifiedCamp    bool      `json:"-"`
+	HasNotifiedVillage bool      `json:"-"`
 }
 
-func (g *Game) startGatheringResources() {
-	for _, resource := range g.resourceMap {
-		resource.LastUpdated = time.Now()
-
-		// Start a goroutine for eacch resource to increase over time
-		go func(res *Resource) {
-			for {
-				time.Sleep(res.Rate)
-				res.Count = res.currentCount()
-				res.LastUpdated = time.Now()
-
-				// Save state after updating resource
-				err := g.saveState()
-				if err != nil {
-					log.Printf("Error while saving state: %v\n", err)
-					return
-				}
-
-				// If camps reach 500 for the first time, allow the purchase of towns
-				if res.Name == "camp" && res.Count >= 500 && !res.TownEnabled {
-					fmt.Println("Your villagers have found clay, and can build bricks with which to create a town. Towns are now available for purchase")
-					res.TownEnabled = true
-				}
-			}
-		}(resource)
-	}
-}
-
-func (r *Resource) currentCount() int {
-	elapsed := time.Since(r.LastUpdated).Seconds()
-	increment := int(elapsed / r.Rate.Seconds())
-	return r.Count + increment
-}
-
-func (g *Game) buyCamps(quantity int) {
-	// Calculate cost of new camps
-	cost := quantity * 50
-	villagers := g.resourceMap["villager"]
-	if villagers.Count < cost {
-		fmt.Printf("You need at least %d villagers to buy %d new camp(s).\n", cost, quantity)
-		return
-	}
-
-	// Deduct cost from villagers
-	villagers.Count -= cost
-	villagers.LastUpdated = time.Now()
-
-	// Add new camps
-	camps := g.resourceMap["camp"]
-	camps.Count += quantity
-	camps.LastUpdated = time.Now()
-
-	totalVillagersPerSecond := g.resourceMap["camp"].Count*CampProductionRate + g.resourceMap["town"].Count*TownProductionRate
-	fmt.Printf("You bought %d new camp(s). Now your civilization produces %d villagers per second.\n", quantity, totalVillagersPerSecond)
-
-}
-
-func (g *Game) buyTowns(quantity int) {
-	cost := quantity * 125
-	villagers := g.resourceMap["villager"]
-	camps := g.resourceMap["camp"]
-
-	// Check for the total of camps required to get your first town
-	if camps.Count < 500 {
-		fmt.Println("Towns are not available for purchase yet. you need at least 500 Camps to purchase a Town!")
-		return
-	}
-
-	if villagers.Count < cost {
-		fmt.Printf("You need at least %d villager to buy %d new town(s).\n", cost, quantity)
-		return
-	}
-
-	villagers.Count -= cost
-	villagers.LastUpdated = time.Now()
-
-	towns := g.resourceMap["town"]
-	towns.Count += quantity
-	towns.LastUpdated = time.Now()
-
-	totalVillagersPerSecond := g.resourceMap["camp"].Count*CampProductionRate + g.resourceMap["town"].Count*TownProductionRate
-	fmt.Printf("You bought %d new town(s). Your Civilization now produces %d villagers per second.\n", quantity, totalVillagersPerSecond)
-
-}
-func (g *Game) loadState() {
-	err := g.db.Update(func(txn *badger.Txn) error {
-		for resourceName := range g.resourceMap {
-			item, err := txn.Get([]byte(resourceName))
-			if err != nil {
-				if err == badger.ErrKeyNotFound {
-					// If the key is not found in the database, initialize it with a default value.
-					res := &Resource{Name: resourceName, Count: 0, Rate: 10 * time.Second, LastUpdated: time.Now()}
-					g.resourceMap[resourceName] = res
-
-					// Save the default resource into the database.
-					var buf bytes.Buffer
-					enc := gob.NewEncoder(&buf)
-					if err := enc.Encode(res); err != nil {
-						return fmt.Errorf("error when trying to encode resource %s: %v", resourceName, err)
-					}
-
-					if err := txn.Set([]byte(resourceName), buf.Bytes()); err != nil {
-						return fmt.Errorf("error when trying to save resource %s: %v", resourceName, err)
-					}
-
-					continue
-				} else {
-					return fmt.Errorf("error when trying to get resource %s: %v", resourceName, err)
-				}
-			}
-
-			err = item.Value(func(val []byte) error {
-				log.Println("Start decoding resource", resourceName)
-
-				buf := bytes.NewBuffer(val)
-				dec := gob.NewDecoder(buf)
-
-				var res Resource
-				err := dec.Decode(&res)
-				if err != nil {
-					return fmt.Errorf("error when trying to decode resource %s: %v", resourceName, err)
-				}
-
-				log.Println("Finished decoding resource", resourceName)
-
-				g.resourceMap[resourceName] = &res
-
-				// Calculate how much time has passed for each resource and update its Count
-				timePassed := time.Since(res.LastUpdated)
-				if res.Rate != 0 {
-					increases := int(timePassed.Seconds() / res.Rate.Seconds())
-					res.Count += increases
-				} else {
-					log.Printf("Warning: Rate for resource %s is 0, not updating Count", resourceName)
-				}
-				res.LastUpdated = time.Now() // reset LastUpdated time to now
-
-				return nil
-			})
-
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
+func NewGame() *Game {
+	// try to load the game, so we don't start with a new game every start
+	game, err := LoadGame()
 	if err != nil {
-		log.Fatalf("Failed to load state: %v", err)
+		// if our loading fails, create a new game state
+		game = &Game{
+			Player: Player{
+				Villagers: 0,
+				Camps:     Camp{Count: 1},
+				Villages:  Village{Count: 0},
+			},
+			Ticker: time.NewTicker(1 * time.Second),
+		}
+		fmt.Println("Starting a new game...")
+
+		// Save the new game immediately
+		if err := SaveGame(game); err != nil {
+			fmt.Printf("Error saving new game: %v\n", err)
+		} else {
+			fmt.Println("Initial game state saved!")
+		}
+	} else {
+		fmt.Println("Loaded saved game!")
 	}
+
+	game.Done = make(chan bool)
+	return game
 }
 
-func (g *Game) saveState() error {
-	return g.db.Update(func(txn *badger.Txn) error {
-		for resourceName, resource := range g.resourceMap {
-			buf := new(bytes.Buffer)
-			enc := gob.NewEncoder(buf)
+func (g *Game) Run() {
+	for {
+		select {
+		case <-g.Done:
+			return
+		case <-g.Ticker.C:
+			g.Player.Villagers += g.Player.Camps.Count + (g.Player.Villages.Count * 3)
 
-			err := enc.Encode(resource)
-			if err != nil {
-				return fmt.Errorf("error when trying to encode resource %s: %v", resourceName, err)
+			if g.Player.Villagers >= 50 && g.Player.Camps.Count < 500 && !g.HasNotifiedCamp {
+				fmt.Println("You can buy a new camp!")
+				g.HasNotifiedCamp = true
 			}
 
-			err = txn.Set([]byte(resourceName), buf.Bytes())
-			if err != nil {
-				return fmt.Errorf("error when trying to save resource %s: %v", resourceName, err)
+			if g.Player.Camps.Count == 500 && !g.HasNotifiedVillage {
+				fmt.Println("You can now purchase a village!")
+				g.HasNotifiedVillage = true
 			}
 		}
-
-		return nil
-	})
-
+	}
 }
-func NewGame(db *badger.DB) (*Game, error) {
-	game := &Game{
-		db:   db,
-		done: make(chan bool),
-		resourceMap: map[string]*Resource{
-			"villager": {
-				Name:        "villager",
-				Description: "Villagers help your civilization to grow.",
-				Cost:        0,
-				Count:       0,
-				BaseRate:    1 * time.Second,
-				Rate:        1 * time.Second,
-				LastUpdated: time.Now(),
-				TownEnabled: false,
-			},
-			"camp": {
-				Name:        "camp",
-				Description: "Camps produce villagers and allow your civilization to grow.",
-				Cost:        50,
-				Count:       1,
-				BaseRate:    1 * time.Second,
-				Rate:        1 * time.Second,
-				LastUpdated: time.Now(),
-				TownEnabled: false,
-			},
-			"town": {
-				Name:        "town",
-				Description: "Towns are an advanced way to grow your civilization and produce more villagers.",
-				Cost:        500,
-				Count:       0,
-				BaseRate:    2 * time.Second,
-				Rate:        2 * time.Second,
-				LastUpdated: time.Now(),
-				TownEnabled: false,
-			},
-		},
+
+// Some vanity stuff for dashboards
+// Center a string within a given width using spaces
+func centerString(s string, width int) string {
+	if len(s) >= width {
+		return s
+	}
+	spaces := (width - len(s)) / 2
+	return strings.Repeat(" ", spaces) + s + strings.Repeat(" ", width-len(s)-spaces)
+}
+
+// playing with dynamic formatting
+func printHelpMenu() {
+	commands := map[string]string{
+		"help (h)":         "Provides help context on commands. Some commands have short alias versions.",
+		"exit":             "Exits the game after saving.",
+		"load":             "Loads a game from memory.",
+		"save":             "Saves your current game to memory. This should be run immediately after using reset",
+		"reset":            "Resets your entire game, no turning back from this one!",
+		"status (s)":       "Shows a dashboard of current resources.",
+		"buy camp (bc)":    "Buy a camp.",
+		"buy village (bv)": "Buy a village.",
 	}
 
-	game.loadState()
+	maxWidthCommand := 0
+	maxWidthDescription := 0
+	for cmd, desc := range commands {
+		if len(cmd) > maxWidthCommand {
+			maxWidthCommand = len(cmd)
+		}
+		if len(desc) > maxWidthDescription {
+			maxWidthDescription = len(desc)
+		}
+	}
 
-	go func() {
-		game.ticker = time.NewTicker(1 * time.Second) // set up a ticker to update every second
-		for {
-			select {
-			case <-game.done:
-				game.ticker.Stop()
-				return
-			case <-game.ticker.C:
-				now := time.Now()
-				camps := game.resourceMap["camp"]
-				towns := game.resourceMap["town"]
-				villagers := game.resourceMap["villager"]
-				villagers.Count += camps.Count*CampProductionRate + towns.Count*TownProductionRate // Increment villagers count by the number of camps and towns
-				villagers.LastUpdated = now
-				err := game.saveState() // save game state after updating resources
+	totalWidth := maxWidthCommand + maxWidthDescription + 7 // 7 = "|" + " " + "|" + " " + "|" + " " + "|"
+
+	header := centerString("Cividler Help Commands", totalWidth-2) // -2 for the border
+	cyan := color.New(color.FgCyan).SprintFunc()
+	yellow := color.New(color.FgYellow).SprintFunc()
+
+	fmt.Println(cyan("+" + strings.Repeat("-", totalWidth) + "+"))
+	fmt.Println(cyan("|"), yellow(header), cyan("|"))
+	fmt.Println(cyan("+" + strings.Repeat("-", totalWidth) + "+"))
+
+	for cmd, desc := range commands {
+		fmt.Printf("| %-"+fmt.Sprint(maxWidthCommand)+"s | %-"+fmt.Sprint(maxWidthDescription)+"s |\n", cmd, desc)
+	}
+
+	fmt.Println(cyan("+" + strings.Repeat("-", totalWidth) + "+"))
+}
+
+func handleCommands(g *Game) {
+	reader := bufio.NewReader(os.Stdin)
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		cmd := scanner.Text()
+
+		switch cmd {
+		case "help", "h":
+			printHelpMenu()
+
+		case "exit", "quit":
+			fmt.Println("Exiting CivIdler, your game progress has been saved")
+			fmt.Println("Sending done signal") //debug message
+			g.Done <- true
+			g.Ticker.Stop()               //Stop the ticker explicitly to try and catch the done signal directly
+			fmt.Println("ticker stopped") //debug message
+			if err := SaveGame(g); err != nil {
+				fmt.Printf("Error saving game: %v\n", err)
+			} else {
+				fmt.Println("Game Saved!")
+			}
+			return
+		case "buy camp", "bc":
+			cyan := color.New(color.FgCyan).SprintFunc()
+			yellow := color.New(color.FgYellow).SprintFunc()
+			if g.Player.Villagers >= 50 && g.Player.Camps.Count < 500 {
+				g.Player.Villagers -= 50
+				g.Player.Camps.Count++
+				fmt.Println("Bought a camp!")
+			} else {
+				fmt.Println(yellow("Cannot buy a camp right now, you need at least"), cyan("50"), yellow("Villagers!"))
+			}
+		case "buy village", "bv":
+			cyan := color.New(color.FgCyan).SprintFunc()
+			yellow := color.New(color.FgYellow).SprintFunc()
+			if g.Player.Camps.Count == 500 && g.Player.Villagers >= 250 {
+				g.Player.Villagers -= 250
+				g.Player.Villages.Count++
+				fmt.Println("Bought a village!")
+			} else {
+				fmt.Println(yellow("Cannot buy a village right now, you need at least"), cyan("250"), yellow("Villagers!"))
+			}
+		case "status", "s":
+			header := centerString("CivIdler", 21)
+			cyan := color.New(color.FgCyan).SprintFunc()
+			yellow := color.New(color.FgYellow).SprintFunc()
+
+			fmt.Println(cyan("+-----------------------+"))
+			fmt.Println(cyan("|"), yellow(header), cyan("|"))
+			fmt.Println(cyan("+-----------------------+"))
+			fmt.Printf("| Villagers | %9d |\n", g.Player.Villagers)
+			fmt.Printf("| Camps     | %9d |\n", g.Player.Camps.Count)
+			fmt.Printf("| Villages  | %9d |\n", g.Player.Villages.Count)
+			fmt.Println(cyan("+-----------------------+"))
+		case "save":
+			if err := SaveGame(g); err != nil {
+				fmt.Printf("Error saving game: %v\n", err)
+			} else {
+				fmt.Println("Game saved!")
+			}
+		case "load":
+			loadedGame, err := LoadGame()
+			if err != nil {
+				fmt.Printf("Error loading game: %v\n", err)
+			} else {
+				g.Player = loadedGame.Player
+				fmt.Println("Game loaded!")
+			}
+		case "reset":
+			yellow := color.New(color.FgYellow).SprintFunc()
+			red := color.New(color.FgRed).SprintFunc()
+			fmt.Println(red("WARNING:"), yellow("This will completely wipe your current game state and cannot be undone!"))
+			fmt.Println(yellow("Make sure to run"), red("save"), yellow("after you have reset, to start a new game!"))
+			fmt.Print("Are you sure you want to reset? (yes/no): ")
+
+			response, _ := reader.ReadString('\n')
+			response = strings.ToLower(strings.TrimSpace(response))
+
+			if response == "yes" {
+				newGame, err := ResetGame()
 				if err != nil {
-					log.Printf("Error while saving state: %v\n", err)
-					return
+					fmt.Printf("Error resetting game: %v\n", err)
+				} else {
+					fmt.Println("Game reset successfully!")
+
+					// Update the current game state
+					*g = *newGame
 				}
+			} else {
+				fmt.Println("Reset aborted!")
 			}
+
 		}
-	}()
+	}
+}
+
+func SaveGame(g *Game) error {
+	g.LastSaved = time.Now()
+
+	gameSerializable := &GameSerializable{
+		Player:             g.Player,
+		LastSaved:          g.LastSaved,
+		HasNotifiedCamp:    g.HasNotifiedCamp,
+		HasNotifiedVillage: g.HasNotifiedVillage,
+	}
+
+	data, err := json.Marshal(gameSerializable)
+	if err != nil {
+		return err
+	}
+
+	g.JustReset = false
+
+	return os.WriteFile("gamestate.json", data, 0644)
+}
+
+func LoadGame() (*Game, error) {
+	data, err := os.ReadFile("gamestate.json")
+	if err != nil {
+		return nil, err
+	}
+
+	var gameSerializable GameSerializable
+	err = json.Unmarshal(data, &gameSerializable)
+	if err != nil {
+		return nil, err
+	}
+
+	// Print when the game was last saved
+	fmt.Printf("Last saved: %s\n", gameSerializable.LastSaved.Format("2006-01-02 15:04:05"))
+
+	// Create a Game instance and populate it from the deserialized data
+	game := &Game{
+		Player:             gameSerializable.Player,
+		Ticker:             time.NewTicker(1 * time.Second),
+		Done:               make(chan bool),
+		LastSaved:          gameSerializable.LastSaved,
+		HasNotifiedCamp:    gameSerializable.HasNotifiedCamp,
+		HasNotifiedVillage: gameSerializable.HasNotifiedVillage,
+	}
+
+	if !game.JustReset {
+		elapsedSeconds := time.Now().Sub(gameSerializable.LastSaved).Seconds()
+		game.Player.Villagers += int(elapsedSeconds) * (game.Player.Camps.Count + (game.Player.Villages.Count * 3))
+	}
 
 	return game, nil
 }
 
+func ResetGame() (*Game, error) {
+	err := os.Remove("gamestate.json")
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a fresh game state
+	newGame := &Game{
+		Player: Player{
+			Villagers: 0,
+			Camps:     Camp{Count: 1},
+			Villages:  Village{Count: 0},
+		},
+		Ticker: time.NewTicker(1 * time.Second),
+		Done:   make(chan bool),
+	}
+
+	return newGame, nil
+}
+
 func main() {
-	// Open BadgerDB
-	dbFile := "gameDB" // define dbFile
-	opts := badger.DefaultOptions(dbFile)
-	db, err := badger.Open(opts)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	game, err := NewGame(db)
-	if err != nil {
-		fmt.Println("Failed to initialize the game:", err)
-		return
-	}
-
-	game.loadState()
-
-	game.startGatheringResources()
-
-	fmt.Println("Welcome to Cividler! The CLI based idle game.")
-	fmt.Println("Commands:")
-	fmt.Println("Type \"help\" to see available commands.")
-
-	// Handle a Ctrl+C event
-	c := make(chan os.Signal)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		// game.stopFindingFlint()
-		os.Exit(0)
-	}()
-
-	// reader := bufio.NewReader(os.Stdin) // define reader
-
-	for {
-		// Print the game's status
-		fmt.Printf("Villagers: %d\n", game.resourceMap["villager"].Count)
-		fmt.Printf("Camps: %d\n", game.resourceMap["camp"].Count)
-		fmt.Printf("Towns: %d\n", game.resourceMap["town"].Count)
-
-		// Wait for the user's command
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Print("Enter command: ")
-		text, _ := reader.ReadString('\n')
-
-		// Split the input command
-		commandParts := strings.Fields(text) // define commandParts
-		command := ""                        // define command
-		if len(commandParts) > 0 {
-			command = commandParts[0]
-		}
-
-		switch command {
-		case "bc":
-			if len(commandParts) < 2 {
-				fmt.Println("Invalid command. Format should be 'bc <number>' or 'bc all'.")
-				continue
-			}
-			var numCampsToBuy int
-
-			if commandParts[1] == "all" {
-				numCampsToBuy = game.resourceMap["villager"].Count / 50
-			} else {
-				numCampsToBuy, err = strconv.Atoi(commandParts[1])
-				if err != nil {
-					fmt.Println("Invalid number of camps to buy. Please enter a valid number.")
-					continue
-				}
-			}
-
-			game.buyCamps(numCampsToBuy)
-
-		case "bt":
-			if len(commandParts) < 2 {
-				fmt.Println("Invalid command. Format should be 'bt <number>' or 'bt all'.")
-				continue
-			}
-			var numTownsToBuy int
-
-			if commandParts[1] == "all" {
-				numTownsToBuy = game.resourceMap["villager"].Count / 125
-			} else {
-				numTownsToBuy, err = strconv.Atoi(commandParts[1])
-				if err != nil {
-					fmt.Println("Invalid number of Towns to buy. Please enter a valid number.")
-					continue
-				}
-			}
-
-			game.buyTowns(numTownsToBuy)
-
-		case "exit", "e":
-			// if the user imputs "exit", save th state and exit the game
-			fmt.Println("Saving and Exiting the game...")
-			game.done <- true
-			err := game.saveState()
-			if err != nil {
-				log.Printf("Error while saving state: %v\n", err)
-				return
-			}
-			os.Exit(0)
-
-		case "resources", "r":
-			fmt.Println("Resources:")
-			var availableCamps, availableTowns, totalCampCost, totalTownCost int
-			for _, resource := range game.resourceMap {
-				fmt.Printf("|%s|%d|\n", resource.Name, resource.Count)
-				if resource.Name == "villager" {
-					availableCamps = resource.Count / 50
-					availableTowns = resource.Count / 125
-					totalCampCost = availableCamps * 50
-					totalTownCost = availableTowns * 125
-				}
-			}
-			if availableCamps > 0 {
-				fmt.Printf("You can buy %d camp(s) for a total cost of %d villagers.\n", availableCamps, totalCampCost)
-			}
-			if availableTowns > 0 {
-				fmt.Printf("You can also buy %d town(s) for a total cost of %d villagers.\n", availableTowns, totalTownCost)
-			}
-
-		case "help", "h":
-			fmt.Println("Commands:")
-			fmt.Println("Type \"bc\" to buy more camps. This will increase the rate at which you create villagers!")
-			fmt.Println("Type \"bt\" to buy more towns. This will increase the rate at which you create villagers!")
-			fmt.Println("Type \"exit\" or \"e\" to save and cleanly exit the game.")
-			fmt.Println("Type \"resources\" or \"r\" to see your current resource counts.")
-			fmt.Println("Type \"help\" to display this help message.")
-
-		default:
-			fmt.Println("Invalid command. Type \"help\" for a list of valid commands.")
-		}
-	}
+	cyan := color.New(color.FgCyan).SprintFunc()
+	yellow := color.New(color.FgYellow).SprintFunc()
+	game := NewGame()
+	go game.Run()
+	fmt.Println("Welcome to CivIdler!")
+	fmt.Println(yellow("Type"), cyan("help"), yellow("to see a list of commands"))
+	handleCommands(game)
 }
