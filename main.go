@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,11 +81,14 @@ func (g *Game) Run() {
 		case <-g.Ticker.C:
 			g.Player.Villagers += g.Player.Camps.Count + (g.Player.Villages.Count * 3)
 
-			if g.Player.Villagers >= 50 && g.Player.Camps.Count < 500 && !g.HasNotifiedCamp {
+			// Notify the player whenever they have enough villagers to buy a new camp
+			if g.Player.Villagers >= 50 && !g.HasNotifiedCamp {
 				fmt.Println("You can buy a new camp!")
 				g.HasNotifiedCamp = true
 			}
 
+			// You can set a condition for notifying about the village purchase if you want
+			// For now, I'm assuming once they have bought 500 camps, they'll be notified about the village
 			if g.Player.Camps.Count == 500 && !g.HasNotifiedVillage {
 				fmt.Println("You can now purchase a village!")
 				g.HasNotifiedVillage = true
@@ -129,19 +133,19 @@ func printHelpMenu() {
 
 	totalWidth := maxWidthCommand + maxWidthDescription + 7 // 7 = "|" + " " + "|" + " " + "|" + " " + "|"
 
-	header := centerString("Cividler Help Commands", totalWidth-2) // -2 for the border
+	header := centerString("Cividler Help Commands", totalWidth-4) // -4 for the border
 	cyan := color.New(color.FgCyan).SprintFunc()
 	yellow := color.New(color.FgYellow).SprintFunc()
 
-	fmt.Println(cyan("+" + strings.Repeat("-", totalWidth) + "+"))
-	fmt.Println(cyan("|"), yellow(header), cyan("|"))
-	fmt.Println(cyan("+" + strings.Repeat("-", totalWidth) + "+"))
+	fmt.Println(cyan("+" + strings.Repeat("-", totalWidth-2) + "+"))
+	fmt.Println(cyan("| ") + yellow(header) + cyan(" |"))
+	fmt.Println(cyan("+" + strings.Repeat("-", totalWidth-2) + "+"))
 
 	for cmd, desc := range commands {
-		fmt.Printf("| %-"+fmt.Sprint(maxWidthCommand)+"s | %-"+fmt.Sprint(maxWidthDescription)+"s |\n", cmd, desc)
+		fmt.Printf(cyan("| ")+yellow("%-"+fmt.Sprint(maxWidthCommand)+"s ")+cyan("| ")+"%-"+fmt.Sprint(maxWidthDescription)+"s "+cyan("|")+"\n", cmd, desc)
 	}
 
-	fmt.Println(cyan("+" + strings.Repeat("-", totalWidth) + "+"))
+	fmt.Println(cyan("+" + strings.Repeat("-", totalWidth-2) + "+"))
 }
 
 func handleCommands(g *Game) {
@@ -149,6 +153,50 @@ func handleCommands(g *Game) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		cmd := scanner.Text()
+
+		// Check if command starts with "buy camp"
+		if strings.HasPrefix(cmd, "buy camp") {
+			fmt.Println("Debug: Inside 'buy camp' command handler")
+			// cyan := color.New(color.FgCyan).SprintFunc()
+			yellow := color.New(color.FgYellow).SprintFunc()
+
+			parts := strings.Split(cmd, " ")
+			var numCamps int
+			if len(parts) == 3 {
+				if parts[2] == "all" {
+					// This should determine the number of camps the player can buy based on the number of villagers they have.
+					numCamps = g.Player.Villagers / 50
+				} else {
+					var err error
+					numCamps, err = strconv.Atoi(parts[2])
+					if err != nil || numCamps <= 0 {
+						fmt.Println("Invalid number of camps")
+						continue
+					}
+				}
+			} else {
+				numCamps = 1
+			}
+
+			// Add a debug log here to understand the number of camps being computed
+			fmt.Printf("Debug: Trying to buy %d camps\n", numCamps)
+
+			totalCost := numCamps * 50
+			if g.Player.Villagers >= totalCost {
+				g.Player.Villagers -= totalCost
+				g.Player.Camps.Count += numCamps
+				if numCamps == 1 {
+					fmt.Println("Bought a camp!")
+				} else {
+					fmt.Printf("Bought %d camps!\n", numCamps)
+				}
+			} else {
+				fmt.Println(yellow("Cannot buy the specified number of camps right now!"))
+				// Another debug log for better understanding
+				fmt.Printf("Debug: Current villagers: %d, Total cost: %d, Current + intended camps: %d\n", g.Player.Villagers, totalCost, g.Player.Camps.Count+numCamps)
+			}
+			continue
+		}
 
 		switch cmd {
 		case "help", "h":
@@ -166,16 +214,7 @@ func handleCommands(g *Game) {
 				fmt.Println("Game Saved!")
 			}
 			return
-		case "buy camp", "bc":
-			cyan := color.New(color.FgCyan).SprintFunc()
-			yellow := color.New(color.FgYellow).SprintFunc()
-			if g.Player.Villagers >= 50 && g.Player.Camps.Count < 500 {
-				g.Player.Villagers -= 50
-				g.Player.Camps.Count++
-				fmt.Println("Bought a camp!")
-			} else {
-				fmt.Println(yellow("Cannot buy a camp right now, you need at least"), cyan("50"), yellow("Villagers!"))
-			}
+
 		case "buy village", "bv":
 			cyan := color.New(color.FgCyan).SprintFunc()
 			yellow := color.New(color.FgYellow).SprintFunc()
